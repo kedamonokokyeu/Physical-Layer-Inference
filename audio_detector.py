@@ -2,6 +2,8 @@ import time
 import argparse
 import threading
 from collections import deque
+import os
+import csv
 
 import numpy as np
 from scipy import signal
@@ -24,10 +26,10 @@ CHUNK = 1024 # frames per callback (-21 ms at 48kHz)
 HP_CUTOFF = 1200 # high-pass cutoff
 HP_ORDER = 4 # for butterworth order
 
-ENV_SMOOTH_MS = 3.0
-DERIV_WINDOW_MS = 2.0
-THRESH_MULT = 6.0
-REFRACTORY_MS = 120.0 # lockout for 15 ms prevent wood vibration detection
+ENV_SMOOTH_MS = 0.5
+DERIV_WINDOW_MS = 0.5
+THRESH_MULT = 3.5
+REFRACTORY_MS = 50.0 # lockout for 50 ms prevent wood vibration detection
 LOOKBACK_MS = 8.0
 
 ANALYSIS_WINDOW_MS = 80.0
@@ -76,23 +78,27 @@ def ema_envelope(input_audio, fs, smooth_ms = 3.0):
 def find_onset(
     envelope: np.ndarray,
     sample_rate_hz: int,
-    derivative_window_ms: float = 2.0,
-    threshold_multiplier: float = 6.0,
+    derivative_window_ms: float = 0.5, # so hammer impact is not averaged for legato detection
+    threshold_multiplier: float = 3.5, # just an arbitrary value I play with to find optimal sensitivity
     search_time_range_s: tuple = (0.0, None),
 ):
 
-    derivative_window_samples = max(
-        1, int(sample_rate_hz * derivative_window_ms / 1000.0) # 2 ms window
-    )
+    derivative_window_samples = max(1, int(sample_rate_hz * derivative_window_ms / 1000.0))
 
-    envelope_slope = (
-        envelope[derivative_window_samples:]
-        - envelope[:-derivative_window_samples]
-    )
+    if (len(envelope) <= derivative_window_samples): # safety check
+        return None 
+
+    lookback_samples = int(sample_rate_hz * 0.010) # 10 ms lookback
+
+    envelope_slope = (envelope[derivative_window_samples:] - envelope[:-derivative_window_samples])
     positive_slope = np.maximum(envelope_slope, 0.0)
 
-    slope_threshold = robust_threshold(positive_slope, mult=threshold_multiplier)
-    trigger_level = 0.5 * slope_threshold  # earlier trigger point since might miss onset if start at slope_threshold
+    # rolling average to get local background slope
+    local_background = np.convolve(
+        positive_slope,
+        np.ones(lookback_samples) / lookback_samples,
+        mode = 'same'
+    ) + 1e-6
 
     search_start_sample = int(search_time_range_s[0] * sample_rate_hz)
     if search_time_range_s[1] is None:
@@ -110,17 +116,25 @@ def find_onset(
     if slope_search_end <= slope_search_start:
         return None
 
-    # after shifting, just look where first index exceeds trigger level
+    # slice both the slope AND the background to compare them directly
+    # matching the window exactly
+    current_slope_window = positive_slope[slope_search_start:slope_search_end]
+    current_bg_window = local_background[slope_search_start:slope_search_end]
+
+    # ADAPTIVE TRIGGER LOGIC, compares slope to local background from lookback
     local_candidates = np.where(
-        positive_slope[slope_search_start:slope_search_end] > trigger_level
+        (current_slope_window > (current_bg_window * threshold_multiplier)) & 
+        ((current_slope_window > 0.002))
     )[0]
 
     if local_candidates.size == 0: # if none exceed trigger level (or no transient found)
         return None
 
+    # map back to the full slope array index, then to envelope index
     onset_slope_index = slope_search_start + int(local_candidates[0])
-
-    return onset_slope_index
+    
+    # return index adjusted for the derivative window offset
+    return onset_slope_index + derivative_window_samples
 
 
 def detect_t_mech_t_acoustic(
@@ -129,13 +143,21 @@ def detect_t_mech_t_acoustic(
     window_start_s: float = 0.0,
     window_len_s: float = 0.08,
 ):
-
     window_start_sample = int(window_start_s * sample_rate_hz)
     window_end_sample = int((window_start_s + window_len_s) * sample_rate_hz)
+    
+    if window_end_sample > len(audio_samples):
+        window_end_sample = len(audio_samples)
+    
     window_audio = audio_samples[window_start_sample:window_end_sample]
+    
+    # if window is too small (edge case), return none
+    if len(window_audio) < 100:
+        return None, None, None, None
 
     # band-pass filters
-    mech_b, mech_a = butter_bandpass(20, 150, sample_rate_hz, order = 4)
+    # widened the Mech band slightly (20-250) to catch softer "thuds"
+    mech_b, mech_a = butter_bandpass(20, 250, sample_rate_hz, order = 4)
     ac_b,   ac_a   = butter_bandpass(3000, 10000, sample_rate_hz, order = 4)
 
     mech_band_audio = signal.lfilter(mech_b, mech_a, window_audio)
@@ -145,17 +167,18 @@ def detect_t_mech_t_acoustic(
     mech_envelope = ema_envelope(mech_band_audio, sample_rate_hz, smooth_ms=0.5)
     ac_envelope   = ema_envelope(ac_band_audio,   sample_rate_hz, smooth_ms=0.5)
 
-    # Onsets inside this window
     mech_onset_sample = find_onset(
         mech_envelope,
         sample_rate_hz,
-        derivative_window_ms = 1.0,
+        derivative_window_ms = 0.5,
+        threshold_multiplier = 1.3, 
         search_time_range_s = (0.0, window_len_s)
     )
     ac_onset_sample = find_onset(
         ac_envelope,
         sample_rate_hz,
-        derivative_window_ms = 1.0,
+        derivative_window_ms = 0.5,
+        threshold_multiplier = 1.3,
         search_time_range_s = (0.0, window_len_s)
     )
 
@@ -180,7 +203,8 @@ def detect_t_mech_t_acoustic(
     return t_mech_s, t_acoustic_s, delta_t_s, ordering
 
 class TransientDetector:
-    def __init__(self, sr=SR, chunk=CHUNK):
+    def __init__(self, sr=SR, chunk=CHUNK, logger=None):
+        self.logger = logger
         self.is_triggered = False
         self.sr = sr
         self.chunk = chunk
@@ -199,11 +223,15 @@ class TransientDetector:
         self.analysis_window_samples = int(sr * ANALYSIS_WINDOW_MS / 1000.0)
         self.ring = deque(maxlen=self.analysis_window_samples * 2)
 
-        hist_seconds = 2.0
+        hist_seconds = 0.1 
         hist_len = int((sr / chunk) * hist_seconds)
-        self.deriv_hist = deque(maxlen=hist_len)
-        self.hist_ready_min = max(10, hist_len // 4)
-        self.sample_cursor = 0  # total samples processed so far
+        self.deriv_hist = deque(maxlen=max(5, hist_len))
+        self.hist_ready_min = 2
+        self.sample_cursor = 0 
+        
+        # analysis state variables for countdown
+        self.analysis_countdown = 0
+        self.frozen_hit_time = 0.0
 
     def process_chunk(self, x: np.ndarray, print_events=True):
 
@@ -212,12 +240,10 @@ class TransientDetector:
         chunk_end_t = self.sample_cursor / self.sr
         now_s = chunk_end_t
 
-        thr = robust_threshold(np.array(self.deriv_hist), mult=THRESH_MULT)
-        min_slope_floor = 0.002
-        thr = max(thr, min_slope_floor)
-
+        # filter Audio
         y, self.zi = signal.lfilter(self.b_hp, self.a_hp, x, zi=self.zi)
 
+        # update Envelope
         abs_y = np.abs(y)
         env = np.empty_like(abs_y)
         e = self.env_prev
@@ -233,6 +259,7 @@ class TransientDetector:
 
         self.ring.extend(y.tolist())
 
+        # calculate Derivative (slope)
         if len(env) > self.deriv_win:
             d = env[self.deriv_win:] - env[:-self.deriv_win]
             dpos = np.maximum(d, 0.0)
@@ -241,63 +268,118 @@ class TransientDetector:
             dpos = np.array([], dtype=np.float32)
             d_peak = 0.0
 
+        # adaptive threshold 
+        if len(self.deriv_hist) >= self.hist_ready_min:
+            if len(self.deriv_hist) > 0:
+                local_median = np.median(self.deriv_hist) + 1e-12
+                thr = local_median * THRESH_MULT 
+            else:
+                thr = 1e9
+        else:
+            thr = 1e9
+
+        min_slope_floor = 0.001 
+        thr = max(thr, min_slope_floor)
+
         refractory_ok = (now_s - self.last_trigger_s) >= self.refractory_s
 
         if refractory_ok:
             self.deriv_hist.append(d_peak)
-
-        if len(self.deriv_hist) >= self.hist_ready_min:
-            thr = robust_threshold(np.array(self.deriv_hist), mult=THRESH_MULT)
-        else:
-            thr = 1e9
 
         is_hit = refractory_ok and (d_peak > thr) and (not self.is_triggered)
 
         if is_hit:
             self.is_triggered = True
             self.last_trigger_s = now_s
-
+            
+            # start wait but dont analyze so that edge cut-off doesn't false trigger another sound
+            self.analysis_countdown = 1 
+            
+            # save the timestamp of the hit
             onset_sample_in_chunk = 0
             if dpos.size > 0:
                 idxs = np.where(dpos > (0.5 * thr))[0]
                 if idxs.size > 0:
                     onset_sample_in_chunk = int(idxs[0]) + self.deriv_win
+            
+            self.frozen_hit_time = chunk_start_t + (onset_sample_in_chunk / self.sr)
 
-            t_mech = t_ac = delta = ordering = None
-            if len(self.ring) >= self.analysis_window_samples:
-                recent = np.array(list(self.ring)[-self.analysis_window_samples:], dtype=np.float32)
-                t_mech, t_ac, delta, ordering = detect_t_mech_t_acoustic(
-                    recent, self.sr, window_len_s=ANALYSIS_WINDOW_MS / 1000.0
-                )
+        if self.analysis_countdown > 0:
+            self.analysis_countdown -= 1
+            
+            if self.analysis_countdown == 0:
+                
+                if len(self.ring) >= self.analysis_window_samples: # don't start until we have enough lookback buffer
+                    recent = np.array(list(self.ring)[-self.analysis_window_samples:], dtype=np.float32)
+                    
+                    t_mech, t_ac, delta, ordering = detect_t_mech_t_acoustic(
+                        recent, self.sr, window_len_s = ANALYSIS_WINDOW_MS / 1000.0
+                    )
 
-            if print_events:
-                t_hit_abs = chunk_start_t + (onset_sample_in_chunk / self.sr)
+                    if self.logger is not None: # logger might be none just in case in future I don't want to do csv file for every testrun 
+                        window_start_t = now_s - (ANALYSIS_WINDOW_MS / 1000.0)
+                        t_m_abs = None if t_mech is None else (window_start_t + t_mech)
+                        t_a_abs = None if t_ac is None else (window_start_t + t_ac)
 
-                window_len_s = ANALYSIS_WINDOW_MS / 1000.0
-                window_start_t = chunk_end_t - window_len_s
+                        self.logger.log( # for the csv EventLogger class
+                            timestamp_s=self.frozen_hit_time, # The exact moment the hammer hit
+                            audio_window=recent,              # The 80ms of audio
+                            t_mech=t_m_abs,                   # Precise labels
+                            t_ac=t_a_abs, 
+                            delta_ms=delta * 1000.0 if delta else 0.0, 
+                            label=ordering if ordering else "uncertain"
+      
+                        )
 
-                t_mech_abs = None if t_mech is None else (window_start_t + t_mech)
-                t_ac_abs   = None if t_ac   is None else (window_start_t + t_ac)
+                    if print_events:
+                        t_hit_abs = self.frozen_hit_time
+                        
+                        window_len_s = ANALYSIS_WINDOW_MS / 1000.0
+                        window_start_t = now_s - window_len_s
 
-                delta_ms = None
-                if t_mech_abs is not None and t_ac_abs is not None:
-                    delta_ms = (t_ac_abs - t_mech_abs) * 1000.0
+                        t_mech_abs = None if t_mech is None else (window_start_t + t_mech)
+                        t_ac_abs   = None if t_ac   is None else (window_start_t + t_ac)
 
-                print(
-                    f"@ {t_hit_abs:.3f}s | "
-                    f"t_mech={0.0 if t_mech_abs is None else t_mech_abs:.4f}s "
-                    f"t_ac={0.0 if t_ac_abs is None else t_ac_abs:.4f}s "
-                    f"Δt={0.0 if delta_ms is None else delta_ms:.1f} ms "
-                    f"{ordering}"
-                )
+                        delta_ms = None
+                        if t_mech_abs is not None and t_ac_abs is not None:
+                            delta_ms = (t_ac_abs - t_mech_abs) * 1000.0
 
-            return {"hit": True, "d_peak": d_peak, "thr": thr, "now_s": now_s}
-        
+                        print(
+                            f"@ {t_hit_abs:.3f}s | "
+                            f"t_mech={0.0 if t_mech_abs is None else t_mech_abs:.4f}s "
+                            f"t_ac={0.0 if t_ac_abs is None else t_ac_abs:.4f}s "
+                            f"Δt={0.0 if delta_ms is None else delta_ms:.1f} ms "
+                            f"{ordering}"
+                        )
+
         elif self.is_triggered:
             if d_peak < (0.5 * thr):
                 self.is_triggered = False
-            return {"hit": False, "d_peak": d_peak, "thr": thr, "now_s": now_s}
 
+        return {"hit": is_hit, "d_peak": d_peak, "thr": thr, "now_s": now_s}
+
+class EventLogger: # turning into csv file for deep learning model later
+    def __init__(self, output_dir = "training_data"): # dir for directory
+        run_id = time.strftime("%Y%m%d_%H%M%S")
+        self.run_dir = os.path.join(output_dir, f"run_{run_id}")
+        self.npy_subdir = os.path.join(self.run_dir, "audio_snippets")
+        os.makedirs(self.npy_subdir, exist_ok = True)
+
+        self.csv_path = os.path.join(self.run_dir, "events.csv")
+        self.csv_file = open(self.csv_path, mode = 'w', newline="")
+        self.writer = csv.writer(self.csv_file)
+        self.writer.writerow(["file_id", "global_t", "t_mech", "t_ac", "delta_ms", "label"])
+
+    def log(self, timestamp_s, audio_window, t_mech, t_ac, delta_ms, label):
+        file_id = f"event_{timestamp_s:.4f}".replace(".", "_")
+        npy_path = os.path.join(self.npy_subdir, f"{file_id}.npy")
+        np.save(npy_path, audio_window.astype(np.float32))
+
+        self.writer.writerow([file_id, timestamp_s, t_mech, t_ac, delta_ms, label])
+        self.csv_file.flush() # good practice so in case crash then save to disk
+
+    def close(self):
+        self.csv_file.close()
 
 # PLOTTING FOR LIVE RECORDING
 def start_live_plot(chunk=CHUNK, sr=SR):
@@ -345,7 +427,7 @@ def run_live(show_plot=False):
     if pyaudio is None:
         raise RuntimeError("PyAudio not installed, cannot run live mode.")
 
-    det = TransientDetector(sr=SR, chunk=CHUNK)
+    det = TransientDetector(sr=SR, chunk=CHUNK, logger=logger)
 
     if show_plot:
         threading.Thread(target=start_live_plot, daemon=True).start()
@@ -380,7 +462,7 @@ def run_live(show_plot=False):
         pa.terminate()
 
 
-def run_wav(path, realtime=False):
+def run_wav(path, realtime=False, logger=None):
     sr_in, data = wavfile.read(path)
 
     # convert to float32 mono [-1, 1]
@@ -407,7 +489,7 @@ def run_wav(path, realtime=False):
         x = signal.resample_poly(x, up, down).astype(np.float32)
         sr_in = SR
 
-    det = TransientDetector(sr=SR, chunk=CHUNK)
+    det = TransientDetector(sr=SR, chunk=CHUNK, logger=logger)
 
     print(f"Running on WAV: {path} (sr={SR}, samples={len(x)})")
     i = 0
@@ -436,14 +518,19 @@ def main():
     ap.add_argument("--wav", type=str, default=None, help="Path to .wav for wav mode")
     ap.add_argument("--realtime", action="store_true", help="In wav mode, sleep to simulate real time")
     ap.add_argument("--plot", action="store_true", help="In live mode, show matplotlib plot")
+    ap.add_argument("--label", type=str, default="training_data", help="Folder name for dataset")
     args = ap.parse_args()
+    logger = EventLogger(output_dir=args.label)
 
-    if args.mode == "wav":
-        if not args.wav:
-            raise SystemExit("Provide --wav path/to/file.wav")
-        run_wav(args.wav, realtime=args.realtime)
-    else:
-        run_live(show_plot=args.plot)
+    try:
+        if args.mode == "wav":
+            if not args.wav:
+                raise SystemExit("Provide --wav path/to/file.wav")
+            run_wav(args.wav, realtime=args.realtime, logger=logger)
+        else:
+            run_live(show_plot=args.plot, logger=logger)
+    finally:
+        logger.close()
 
 if __name__ == "__main__":
     main()
