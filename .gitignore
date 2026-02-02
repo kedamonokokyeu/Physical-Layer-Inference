@@ -1,0 +1,11 @@
+# Virtual environments
+.venv/
+venv/
+
+# Training / data
+training_data/
+
+# Python junk
+__pycache__/
+*.pyc
+
